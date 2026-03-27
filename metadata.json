@@ -1,0 +1,5 @@
+{
+  "name": "ER Training Simulator 3D",
+  "description": "An interactive 3D emergency room training simulator with AI-powered conversational characters.",
+  "requestFramePermissions": ["microphone"]
+}
