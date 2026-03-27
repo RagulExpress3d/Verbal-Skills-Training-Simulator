@@ -4,6 +4,8 @@ export interface Vitals {
   spo2: number;
 }
 
+export type SimulationMode = 'standard' | 'guided' | 'training';
+
 export interface ScenarioState {
   patientAnxiety: number; // 0 to 1
   isEscalated: boolean;
@@ -12,6 +14,10 @@ export interface ScenarioState {
   lastUserInteraction: number;
   missedQuestions: string[];
   askedQuestions: string[];
+  mode: SimulationMode;
+  timer: number; // seconds remaining
+  liveScore: number; // 0 to 100
+  guidancePrompt: string;
 }
 
 export type CharacterType = 'patient' | 'nurse' | 'attending' | 'user';

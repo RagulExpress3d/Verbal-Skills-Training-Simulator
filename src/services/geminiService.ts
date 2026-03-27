@@ -13,7 +13,7 @@ export class GeminiLiveService {
   }
 
   private nextStartTime: number = 0;
-
+  private currentTurnText: string = "";
   private audioWorkletUrl: string | null = null;
 
   async connect(callbacks: {
@@ -26,6 +26,7 @@ export class GeminiLiveService {
       await this.audioContext.resume();
     }
     this.nextStartTime = this.audioContext.currentTime;
+    this.currentTurnText = "";
 
     this.session = await this.ai.live.connect({
       model: "gemini-3.1-flash-live-preview",
@@ -33,7 +34,7 @@ export class GeminiLiveService {
         systemInstruction: SYSTEM_INSTRUCTION,
         responseModalities: [Modality.AUDIO],
         speechConfig: {
-          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Puck" } },
+          voiceConfig: { prebuiltVoiceConfig: { voiceName: "Kore" } },
         },
       },
       callbacks: {
@@ -41,11 +42,12 @@ export class GeminiLiveService {
           if (message.serverContent?.modelTurn?.parts) {
             for (const part of message.serverContent.modelTurn.parts) {
               if (part.text) {
-                const match = part.text.match(/\[(.*?)\](.*)/);
+                this.currentTurnText += part.text;
+                const match = this.currentTurnText.match(/\[(.*?)\](.*)/);
                 if (match && match[1] && match[2]) {
                   callbacks.onMessage(match[2].trim(), match[1].trim());
                 } else {
-                  callbacks.onMessage(part.text, 'Patient');
+                  callbacks.onMessage(this.currentTurnText, 'Patient');
                 }
               }
               if (part.inlineData?.data) {
@@ -54,8 +56,12 @@ export class GeminiLiveService {
               }
             }
           }
+          if (message.serverContent?.turnComplete) {
+            this.currentTurnText = "";
+          }
           if (message.serverContent?.interrupted) {
             this.stopAudio();
+            this.currentTurnText = "";
             callbacks.onInterrupted();
           }
         },

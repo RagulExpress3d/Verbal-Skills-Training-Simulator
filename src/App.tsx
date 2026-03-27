@@ -61,6 +61,10 @@ export default function App() {
     lastUserInteraction: Date.now(),
     missedQuestions: [],
     askedQuestions: [],
+    mode: 'standard',
+    timer: 30,
+    liveScore: 0,
+    guidancePrompt: "Introduce yourself to the patient and ask about their pain.",
   });
 
   const geminiRef = useRef<GeminiLiveService | null>(null);
@@ -80,8 +84,23 @@ export default function App() {
       const timeSinceLastInteraction = now - scenario.lastUserInteraction;
       const timeSinceStart = now - scenario.startTime;
       
-      // Nurse intervention after 20 seconds of silence
-      if (timeSinceLastInteraction > 20000 && !scenario.nurseIntervened) {
+      // Timer logic for guided/training mode
+      if (scenario.mode !== 'standard' && isStarted && !isEvaluating) {
+        setScenario(prev => {
+          const newTimer = Math.max(0, prev.timer - 3);
+          let newGuidance = prev.guidancePrompt;
+          
+          if (newTimer === 0 && !prev.nurseIntervened) {
+            handleGeminiMessage("[Nurse] Doctor, we need to act. Should we get an EKG or start some oxygen?");
+            return { ...prev, timer: 30, nurseIntervened: true, guidancePrompt: "Respond to the nurse's suggestion." };
+          }
+          
+          return { ...prev, timer: newTimer };
+        });
+      }
+
+      // Nurse intervention after 20 seconds of silence in standard mode
+      if (scenario.mode === 'standard' && timeSinceLastInteraction > 20000 && !scenario.nurseIntervened) {
         handleGeminiMessage("[Nurse] Doctor, the patient seems to be getting more anxious. Should we start him on some oxygen or get that EKG?");
         setScenario(prev => ({ ...prev, nurseIntervened: true, lastUserInteraction: now }));
       }
@@ -137,49 +156,86 @@ export default function App() {
     return () => clearInterval(interval);
   }, [isStarted, isEvaluating, scenario.lastUserInteraction, scenario.nurseIntervened, scenario.patientAnxiety, scenario.isEscalated, transcript]);
 
-  const startSimulation = async () => {
+  const handleGeminiMessage = (msg: string, forcedSpeaker?: string) => {
+    const match = msg.match(/\[(.*?)\](.*)/);
+    const speaker = forcedSpeaker || ((match && match[1]) ? match[1] : 'Patient');
+    const text = (match && match[2]) ? match[2].trim() : msg;
+    
+    setTranscript(prev => {
+      // If the last message was from the same speaker, update it instead of adding a new one
+      // This allows for real-time streaming updates
+      if (prev.length > 0 && prev[prev.length - 1].speaker === speaker.toLowerCase()) {
+        const newTranscript = [...prev];
+        newTranscript[newTranscript.length - 1] = {
+          ...newTranscript[newTranscript.length - 1],
+          text: text,
+          timestamp: Date.now()
+        };
+        return newTranscript;
+      }
+      return [...prev, { speaker: speaker.toLowerCase() as any, text, timestamp: Date.now() }];
+    });
+    setCurrentSpeaker(speaker);
+    setSubtitle(text);
+    setScenario(prev => {
+      // Live scoring logic
+      const lowerText = text.toLowerCase();
+      let scoreBoost = 0;
+      let newGuidance = prev.guidancePrompt;
+
+      if (speaker.toLowerCase() === 'user') {
+        if (lowerText.includes('ekg') || lowerText.includes('electrocardiogram')) {
+          scoreBoost += 20;
+          newGuidance = "Great. Now ask about the quality of the pain (crushing, sharp, etc.)";
+        }
+        if (lowerText.includes('oxygen')) {
+          scoreBoost += 15;
+          newGuidance = "Good. Monitor his SpO2 levels.";
+        }
+        if (lowerText.includes('aspirin') || lowerText.includes('nitro')) {
+          scoreBoost += 25;
+          newGuidance = "Medication ordered. Keep talking to the patient to keep him calm.";
+        }
+        if (lowerText.includes('family') || lowerText.includes('history')) {
+          scoreBoost += 10;
+        }
+      }
+
+      return { 
+        ...prev, 
+        lastUserInteraction: Date.now(),
+        timer: 30, // Reset timer on interaction
+        liveScore: Math.min(100, prev.liveScore + scoreBoost),
+        guidancePrompt: newGuidance
+      };
+    });
+  };
+
+  const startSimulation = async (mode: any = 'standard') => {
     try {
       setIsStarted(true);
+      setScenario(prev => ({ ...prev, mode, startTime: Date.now(), lastUserInteraction: Date.now() }));
+      
       geminiRef.current = new GeminiLiveService();
       await geminiRef.current.connect({
         onMessage: (text, speaker) => {
-          setTranscript(prev => [...prev, { speaker: speaker.toLowerCase() as any, text, timestamp: Date.now() }]);
-          setCurrentSpeaker(speaker);
-          setSubtitle(text);
-          setScenario(prev => ({ ...prev, lastUserInteraction: Date.now() }));
-          
-          if (speaker.toLowerCase() === 'attending') {
-            setScenario(prev => ({ ...prev, isEscalated: true }));
-          }
+          handleGeminiMessage(text, speaker);
         },
-        onAudioChunk: (base64) => {
-          // In a full implementation, we'd play the audio here
-        },
+        onAudioChunk: () => {},
         onInterrupted: () => {
           setSubtitle("");
           setCurrentSpeaker(null);
         }
       });
 
-      // Initial patient greeting
-      setTimeout(() => {
-        handleGeminiMessage("[Patient] Oh, doctor... thank god you're here. My chest... it feels like an elephant is sitting on it.");
-      }, 1000);
+      // Initial trigger to make AI speak immediately
+      await geminiRef.current.sendMessage(`[System] The simulation has started in ${mode} mode. You are the patient (Mr. Henderson, 58, chest pain) and occasionally the Nurse. Start the conversation by describing your pain and asking what's happening.`);
+      
     } catch (error) {
       console.error("Failed to start simulation:", error);
       alert("Failed to connect to AI service. Please check your API key.");
       setIsStarted(false);
     }
-  };
-
-  const handleGeminiMessage = (msg: string) => {
-    const match = msg.match(/\[(.*?)\](.*)/);
-    const speaker = (match && match[1]) ? match[1] : 'Patient';
-    const text = (match && match[2]) ? match[2].trim() : msg;
-    
-    setTranscript(prev => [...prev, { speaker: speaker.toLowerCase() as any, text, timestamp: Date.now() }]);
-    setCurrentSpeaker(speaker);
-    setSubtitle(text);
   };
 
   const toggleListening = async () => {
@@ -238,7 +294,8 @@ export default function App() {
     setVitals(INITIAL_VITALS);
     setSubtitle("");
     setCurrentSpeaker(null);
-    setScenario({
+    setScenario(prev => ({
+      ...prev,
       patientAnxiety: 0.7,
       isEscalated: false,
       nurseIntervened: false,
@@ -246,7 +303,11 @@ export default function App() {
       lastUserInteraction: Date.now(),
       missedQuestions: [],
       askedQuestions: [],
-    });
+      mode: 'standard',
+      timer: 30,
+      liveScore: 0,
+      guidancePrompt: "Introduce yourself to the patient and ask about their pain.",
+    }));
   };
 
   const calculateEvaluation = (): Evaluation => {
@@ -254,7 +315,7 @@ export default function App() {
     const hasEscalated = scenario.isEscalated;
     const nurseIntervened = scenario.nurseIntervened;
     
-    const clarityScore = Math.min(100, 60 + (askedCount * 20));
+    const clarityScore = Math.max(scenario.liveScore, Math.min(100, 60 + (askedCount * 20)));
     const empathyScore = Math.max(0, Math.min(100, 100 - (scenario.patientAnxiety * 50)));
     const timingScore = nurseIntervened ? 65 : 95;
 
@@ -300,6 +361,26 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-6">
+          {/* Guided Mode Info */}
+          {scenario.mode !== 'standard' && isStarted && (
+            <div className="flex items-center gap-6 px-4 py-2 bg-slate-800/50 rounded-full border border-slate-700">
+              <div className="flex items-center gap-2">
+                <Activity className="w-4 h-4 text-blue-400" />
+                <span className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">Score</span>
+                <span className="text-sm font-bold text-blue-400">{scenario.liveScore}%</span>
+              </div>
+              <div className="w-px h-4 bg-slate-700" />
+              <div className="flex items-center gap-2">
+                <ClipboardList className="w-4 h-4 text-amber-400" />
+                <span className="text-[10px] font-mono text-slate-400 uppercase tracking-wider">Time</span>
+                <span className={cn(
+                  "text-sm font-bold",
+                  scenario.timer < 10 ? "text-red-500 animate-pulse" : "text-amber-400"
+                )}>{scenario.timer}s</span>
+              </div>
+            </div>
+          )}
+
           <div className="flex items-center gap-4 bg-slate-800/50 px-4 py-2 rounded-full border border-slate-700">
             <div className="flex flex-col items-center">
               <span className="text-[10px] text-slate-500 uppercase">HR</span>
@@ -339,25 +420,78 @@ export default function App() {
         <div className="flex-1 relative bg-slate-900">
           {!isStarted ? (
             <div className="absolute inset-0 flex items-center justify-center z-20 bg-slate-900/80 backdrop-blur-sm">
-              <div className="max-w-md text-center p-8 bg-slate-800 rounded-3xl border border-slate-700 shadow-2xl">
+              <div className="max-w-4xl text-center p-8 bg-slate-800 rounded-3xl border border-slate-700 shadow-2xl">
                 <div className="w-20 h-20 bg-blue-600/20 rounded-full flex items-center justify-center mx-auto mb-6">
                   <User className="text-blue-500 w-10 h-10" />
                 </div>
                 <h2 className="text-2xl font-bold mb-4">Start Training Session</h2>
-                <p className="text-slate-400 mb-6">
-                  You are the primary responder for a 58-year-old male presenting with acute chest pain. 
-                  Communicate with the patient and team to stabilize and escalate.
-                </p>
+                
+                {/* Patient Case History */}
+                <div className="bg-slate-900/50 border border-slate-700 rounded-2xl p-6 mb-8 text-left">
+                  <h3 className="text-xs font-bold text-blue-400 uppercase tracking-widest mb-4 flex items-center gap-2">
+                    <ClipboardList size={14} /> Patient Case History
+                  </h3>
+                  <div className="grid grid-cols-2 gap-x-8 gap-y-4">
+                    <div>
+                      <span className="text-[10px] text-slate-500 uppercase block mb-1">Patient</span>
+                      <p className="text-sm font-medium">Arthur Henderson, 58</p>
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-slate-500 uppercase block mb-1">Profession</span>
+                      <p className="text-sm font-medium">Retired High School Teacher</p>
+                    </div>
+                    <div className="col-span-2">
+                      <span className="text-[10px] text-slate-500 uppercase block mb-1">Chief Complaint</span>
+                      <p className="text-sm font-medium text-red-400">Acute "crushing" chest pain (10/10) for 30 minutes.</p>
+                    </div>
+                    <div className="col-span-2">
+                      <span className="text-[10px] text-slate-500 uppercase block mb-1">Situation</span>
+                      <p className="text-sm text-slate-300 leading-relaxed">
+                        Sudden onset while gardening. Pain radiates to left jaw and arm. 
+                        Patient is diaphoretic (sweating) and highly anxious.
+                      </p>
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-slate-500 uppercase block mb-1">Medical History</span>
+                      <p className="text-sm text-slate-300">Hypertension, Smoker (1 pack/day)</p>
+                    </div>
+                    <div>
+                      <span className="text-[10px] text-slate-500 uppercase block mb-1">Initial Vitals</span>
+                      <p className="text-sm text-slate-300 font-mono">HR 102, BP 150/95, SpO2 96%</p>
+                    </div>
+                  </div>
+                </div>
+
                 <div className="flex items-center gap-2 text-xs text-amber-400 bg-amber-400/10 p-3 rounded-xl mb-8 border border-amber-400/20">
                   <AlertTriangle size={14} className="shrink-0" />
                   <span>This app requires microphone access for conversational training.</span>
                 </div>
-                <button 
-                  onClick={startSimulation}
-                  className="w-full bg-blue-600 hover:bg-blue-500 text-white py-4 rounded-2xl font-bold text-lg transition-all transform hover:scale-[1.02] active:scale-[0.98]"
-                >
-                  Begin Simulation
-                </button>
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 w-full max-w-4xl mb-8">
+            <button 
+              onClick={() => startSimulation('standard')}
+              className="group p-6 bg-slate-900/80 border border-slate-800 hover:border-blue-500 rounded-2xl transition-all text-left"
+            >
+              <Activity className="w-8 h-8 text-blue-500 mb-4 group-hover:scale-110 transition-transform" />
+              <h3 className="text-lg font-bold mb-2">Standard Mode</h3>
+              <p className="text-sm text-slate-400">Open-ended simulation with no guidance. Best for experienced trainees.</p>
+            </button>
+            <button 
+              onClick={() => startSimulation('guided')}
+              className="group p-6 bg-slate-900/80 border border-slate-800 hover:border-amber-500 rounded-2xl transition-all text-left"
+            >
+              <ClipboardList className="w-8 h-8 text-amber-500 mb-4 group-hover:scale-110 transition-transform" />
+              <h3 className="text-lg font-bold mb-2">Guided Mode</h3>
+              <p className="text-sm text-slate-400">Includes clinical prompts, a live score, and a response timer.</p>
+            </button>
+            <button 
+              onClick={() => startSimulation('training')}
+              className="group p-6 bg-slate-900/80 border border-slate-800 hover:border-red-500 rounded-2xl transition-all text-left"
+            >
+              <Mic className="w-8 h-8 text-red-500 mb-4 group-hover:scale-110 transition-transform" />
+              <h3 className="text-lg font-bold mb-2">Training Mode</h3>
+              <p className="text-sm text-slate-400">Voice-only interaction. Hides text input to force verbal communication.</p>
+            </button>
+          </div>
               </div>
             </div>
           ) : null}
@@ -432,6 +566,17 @@ export default function App() {
         <aside className="w-96 border-l border-slate-800 bg-slate-900/50 flex flex-col">
           {/* Status Panel */}
           <div className="p-6 border-b border-slate-800">
+            {/* Guidance Panel */}
+            {scenario.mode !== 'standard' && isStarted && (
+              <div className="mb-6 p-4 bg-blue-900/20 border border-blue-500/30 rounded-xl">
+                <div className="flex items-center gap-2 mb-2">
+                  <ClipboardList className="w-4 h-4 text-blue-400" />
+                  <span className="text-[10px] font-bold text-blue-400 uppercase tracking-wider">Clinical Guidance</span>
+                </div>
+                <p className="text-sm text-blue-100 italic leading-relaxed">"{scenario.guidancePrompt}"</p>
+              </div>
+            )}
+
             <h3 className="text-xs font-bold uppercase tracking-widest text-slate-500 mb-4 flex items-center gap-2">
               <ClipboardList size={14} /> Scenario Status
             </h3>
@@ -489,38 +634,62 @@ export default function App() {
 
           {/* Input Area */}
           <div className="p-6 bg-slate-900 border-t border-slate-800">
-            <div className="relative">
-              <input 
-                type="text"
-                value={userInput}
-                onChange={(e) => setUserInput(e.target.value)}
-                onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
-                placeholder="Type your response..."
-                disabled={!isStarted}
-                className="w-full bg-slate-800 border border-slate-700 rounded-2xl py-4 pl-4 pr-24 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
-              />
-              <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
-                <button 
+            {scenario.mode === 'training' && isStarted ? (
+              <div className="flex flex-col items-center justify-center py-4 space-y-4">
+                <div className="flex items-center gap-2 text-amber-400 bg-amber-400/10 px-3 py-1.5 rounded-full border border-amber-400/20">
+                  <AlertTriangle size={12} />
+                  <span className="text-[10px] font-bold uppercase tracking-wider">Voice Training Mode</span>
+                </div>
+                <p className="text-[10px] text-slate-500 text-center max-w-[200px]">Text input disabled. Use your voice to communicate under pressure.</p>
+                <button
                   onClick={toggleListening}
-                  disabled={!isStarted}
                   className={cn(
-                    "p-2 rounded-xl transition-colors",
-                    isListening ? "bg-red-500 text-white animate-pulse" : "text-slate-400 hover:text-white"
+                    "w-16 h-16 rounded-full flex items-center justify-center transition-all duration-300",
+                    isListening 
+                      ? "bg-red-600 shadow-[0_0_25px_rgba(220,38,38,0.5)] scale-110" 
+                      : "bg-blue-600 hover:bg-blue-700 shadow-lg shadow-blue-900/20"
                   )}
                 >
-                  {isListening ? <Mic size={20} /> : <MicOff size={20} />}
+                  {isListening ? <Mic size={32} className="text-white" /> : <MicOff size={32} className="text-white/50" />}
                 </button>
-                <button 
-                  onClick={handleSendMessage}
-                  disabled={!isStarted || !userInput.trim()}
-                  className="p-2 bg-blue-600 text-white rounded-xl hover:bg-blue-500 disabled:opacity-50"
-                >
-                  <Send size={20} />
-                </button>
+                <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest animate-pulse">
+                  {isListening ? "Listening..." : "Click to Speak"}
+                </span>
               </div>
-            </div>
+            ) : (
+              <div className="relative">
+                <input 
+                  type="text"
+                  value={userInput}
+                  onChange={(e) => setUserInput(e.target.value)}
+                  onKeyPress={(e) => e.key === 'Enter' && handleSendMessage()}
+                  placeholder="Type your response..."
+                  disabled={!isStarted}
+                  className="w-full bg-slate-800 border border-slate-700 rounded-2xl py-4 pl-4 pr-24 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                />
+                <div className="absolute right-2 top-1/2 -translate-y-1/2 flex items-center gap-1">
+                  <button 
+                    onClick={toggleListening}
+                    disabled={!isStarted}
+                    className={cn(
+                      "p-2 rounded-xl transition-colors",
+                      isListening ? "bg-red-500 text-white animate-pulse" : "text-slate-400 hover:text-white"
+                    )}
+                  >
+                    {isListening ? <Mic size={20} /> : <MicOff size={20} />}
+                  </button>
+                  <button 
+                    onClick={handleSendMessage}
+                    disabled={!isStarted || !userInput.trim()}
+                    className="p-2 bg-blue-600 text-white rounded-xl hover:bg-blue-500 disabled:opacity-50"
+                  >
+                    <Send size={20} />
+                  </button>
+                </div>
+              </div>
+            )}
             <p className="text-[10px] text-slate-600 mt-3 text-center uppercase tracking-widest">
-              Press Enter to send • Voice input enabled
+              {scenario.mode === 'training' ? "Voice Only" : "Press Enter to send • Voice input enabled"}
             </p>
           </div>
         </aside>
